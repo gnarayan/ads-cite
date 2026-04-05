@@ -41,6 +41,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Structure: _http_call wraps urllib with ADS-specific error translation;
+# api_{get,post} thin wrappers over it; cmd_* functions are the CLI verbs.
+
 ADS = "https://api.adsabs.harvard.edu/v1"
 BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
 
@@ -148,6 +151,8 @@ def _print_results(docs: list[dict]) -> None:
 
 
 def cmd_search(query: str) -> None:
+    # Filter to astronomy DB and to journal articles + arXiv preprints —
+    # excludes AAS meeting abstracts, conference proceedings, PhD theses.
     token = get_token()
     params = [
         ("q", query),
@@ -209,7 +214,8 @@ def cmd_arxiv(arxiv_id: str) -> None:
     params = [
         ("q", f"identifier:arXiv:{arxiv_id}"),
         ("fl", "bibcode,title,author,year,citation_count,pub,doctype"),
-        # sort article before eprint so refereed version comes first
+        # Lexicographic sort on doctype puts "article" before "eprint",
+        # so any refereed version surfaces ahead of the preprint.
         ("sort", "doctype asc,date desc"),
         ("rows", "5"),
     ]
@@ -242,6 +248,8 @@ def cmd_doi(doi: str) -> None:
 
 
 def cmd_citations(bibcode: str) -> None:
+    # ADS's citations() query operator returns the set of papers citing the
+    # matches of its inner query — here, the single record with this bibcode.
     token = get_token()
     params = [
         ("q", f"citations(bibcode:{bibcode})"),
