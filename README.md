@@ -193,6 +193,32 @@ ads-cite references 2024PASP..136f4501G --sort "citation_count desc" --rows 20
 
 Default filters applied: `database:astronomy` + `doctype:(article OR eprint)` — so AAS abstracts, PhD theses, and conference proceedings are excluded; refereed journals and arXiv preprints both show.
 
+## Troubleshooting & common pitfalls
+
+**"No ADS record found" for a bibcode / arXiv ID / DOI you know exists.**
+Check the input for silent mangling:
+- arXiv: `v2` suffixes and URL wrappers (`https://arxiv.org/abs/…`) are stripped automatically; bare versioned IDs (`2510.07637v2`) work.
+- DOI: `https://doi.org/…`, `dx.doi.org/…`, and `doi:` prefixes are stripped automatically.
+- Bibcode: must be 19 chars, 4-digit year + 15 compact chars, no spaces. `ads-cite` validates format and prints a clear error if it's malformed.
+
+**401 from ADS** — the token is wrong or was copy-pasted with surrounding quotes or newlines. Regenerate at https://ui.adsabs.harvard.edu → Account Settings → API Token and re-store it.
+
+**Keychain keeps prompting** — click "Always Allow" the first time. If you already dismissed the dialog, delete the entry (`security delete-generic-password -a "$USER" -s "nasa-ads-api-token"`) and re-add it.
+
+**Rekey'd citekeys look wrong** (e.g., generic subject like `Paper`, or a non-ASCII author name stripped to something unreadable) — pass `--subject WORD` explicitly. Non-ASCII chars in author surnames are stripped (`Müller` → `Mller`); if you care, set the subject explicitly or live with the collision.
+
+**Duplicate citekeys from `--rekey`** (two papers by the same author, same year, same auto-derived subject) — you'll get two entries with identical citekeys. LaTeX will warn. Override with a distinguishing `--subject` for one of them.
+
+**Appending to a path whose parent directory doesn't exist** — `ads-cite` creates the parent directory automatically. Good for starting a new proposal.
+
+**Mixing `--rekey` and non-rekey styles in one `.bib`** — works; dedup scans both the citekey and the `% ADS bibcode:` comment. But LaTeX users will find it jarring to see both styles; pick one per file.
+
+**`.bib` file with a BOM or DOS line endings** — BOM is stripped on read. DOS endings don't affect the dedup regex.
+
+**Preprint returned when you wanted the refereed version** — `arxiv` subcommand already prefers articles over eprints. For direct `search`, if you see an `arXiv` bibcode, check ADS for a linked published version.
+
+**Matching existing `.bib` convention** — if the file already has entries keyed by raw bibcode, drop `--rekey` to keep the file consistent.
+
 ## Rate limits
 
 ADS allows 5000 API queries/day per token. A single search + bibtex export is ~2 requests.

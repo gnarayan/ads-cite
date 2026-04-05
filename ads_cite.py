@@ -35,6 +35,42 @@ BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
 # Fields returned for list-style output (search / citations / references / arxiv / doi)
 LIST_FL = "bibcode,title,author,year,citation_count,pub"
 
+# ADS bibcode format: 4-digit year + 15 compact characters (journal code,
+# volume, page, initial). Total length is always 19, no internal whitespace.
+_BIBCODE_RE = re.compile(r"^\d{4}\S{15}$")
+
+
+def _clean_bibcode(bc: str) -> str:
+    """Strip whitespace and common copy-paste wrappers from a bibcode, then
+    validate its format. Die with a helpful message if malformed."""
+    bc = bc.strip().strip("<>[](){}\"'")
+    if not _BIBCODE_RE.match(bc):
+        _die(f"Bibcode format looks invalid: {bc!r}\n"
+             "Expected: 19 chars, 4-digit year + 15 compact chars, no spaces.\n"
+             "Example:  2016ApJS..224....3N")
+    return bc
+
+
+def _clean_arxiv_id(s: str) -> str:
+    """Extract a bare arXiv ID from URLs, 'arXiv:' prefixes, version suffixes."""
+    s = s.strip()
+    # Strip URL wrappers: https://arxiv.org/abs/2510.07637 → 2510.07637
+    m = re.search(r"arxiv\.org/(?:abs|pdf)/([^/?\s]+)", s, re.I)
+    if m:
+        s = m.group(1)
+    # Strip 'arXiv:' prefix and version suffix 'v1', 'v2', ...
+    s = re.sub(r"^arXiv:", "", s, flags=re.I)
+    s = re.sub(r"v\d+$", "", s)
+    return s.strip()
+
+
+def _clean_doi(s: str) -> str:
+    """Strip 'doi:', 'https://doi.org/', 'dx.doi.org/' prefixes from a DOI."""
+    s = s.strip()
+    s = re.sub(r"^(?:https?://)?(?:dx\.)?doi\.org/", "", s, flags=re.I)
+    s = re.sub(r"^doi:\s*", "", s, flags=re.I)
+    return s.strip()
+
 QUERY_SYNTAX = """\
 Query syntax (search/citations/references):
   author:"Narayan, G."     author (use ^Name for first author only)
@@ -217,6 +253,7 @@ def cmd_citations(bibcode: str, rows: Optional[int], sort: Optional[str],
 
     Tool spec: { bibcode: string, rows?: int, sort?: string, json?: bool }
     """
+    bibcode = _clean_bibcode(bibcode)
     _list_search(f"citations(bibcode:{bibcode})",
                  "citation_count desc", 20, rows, sort, json_out)
 
@@ -229,6 +266,7 @@ def cmd_references(bibcode: str, rows: Optional[int], sort: Optional[str],
 
     Tool spec: { bibcode: string, rows?: int, sort?: string, json?: bool }
     """
+    bibcode = _clean_bibcode(bibcode)
     _list_search(f"references(bibcode:{bibcode})",
                  "date desc", 50, rows, sort, json_out)
 
@@ -239,6 +277,7 @@ def cmd_show(bibcode: str, json_out: bool) -> None:
 
     Tool spec: { bibcode: string, json?: bool }
     """
+    bibcode = _clean_bibcode(bibcode)
     token = get_token()
     params = [
         ("q", f"bibcode:{bibcode}"),
@@ -343,6 +382,7 @@ def cmd_bibtex(bibcodes: list[str], json_out: bool,
     if subject and len(bibcodes) > 1:
         _die("--subject applies to a single bibcode; for batches, omit it "
              "and let the auto-derive choose per-entry subjects.")
+    bibcodes = [_clean_bibcode(b) for b in bibcodes]
     token = get_token()
     data = api_post("/export/bibtex", {"bibcode": bibcodes}, token)
     export = data.get("export", "")
@@ -364,8 +404,7 @@ def cmd_arxiv(arxiv_id: str, json_out: bool) -> None:
     Tool spec: { arxiv_id: string, json?: bool }
     """
     token = get_token()
-    # strip any leading "arXiv:" prefix; keep bare ID
-    arxiv_id = arxiv_id.removeprefix("arXiv:").removeprefix("arxiv:").strip()
+    arxiv_id = _clean_arxiv_id(arxiv_id)
     params = [
         ("q", f"identifier:arXiv:{arxiv_id}"),
         ("fl", f"{LIST_FL},doctype"),
@@ -393,6 +432,7 @@ def cmd_doi(doi: str, json_out: bool) -> None:
 
     Tool spec: { doi: string, json?: bool }
     """
+    doi = _clean_doi(doi)
     token = get_token()
     params = [
         ("q", f'doi:"{doi}"'),
@@ -421,11 +461,17 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
     if subject and len(bibcodes) > 1:
         _die("--subject applies to a single bibcode; for batches, omit it "
              "and let the auto-derive choose per-entry subjects.")
+    bibcodes = [_clean_bibcode(b) for b in bibcodes]
     path = Path(bibfile).expanduser()
+    if path.is_dir():
+        _die(f"Target path is a directory, not a .bib file: {path}")
     existing_text = ""
     existing_bibcodes: set[str] = set()
     if path.exists():
         existing_text = path.read_text()
+        # Strip BOM if present so regex matches the first entry correctly
+        if existing_text.startswith("\ufeff"):
+            existing_text = existing_text[1:]
         # Collect identifiers that could match an incoming bibcode, from:
         # (a) citekeys (old-style entries key'd by bibcode), and
         # (b) '% ADS bibcode: <X>' comments (rekey'd entries).
@@ -455,6 +501,8 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
             sep = "\n"
         else:
             sep = "\n\n"
+        # Create parent dir if missing (typical when starting a new proposal).
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as f:
             f.write(sep + export + "\n")
         result["bibtex_written"] = export
