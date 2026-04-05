@@ -365,6 +365,43 @@ def _split_bibtex_entries(export: str) -> list[str]:
     return [e.rstrip() for e in entries]
 
 
+def _sort_bib_chronologically(text: str) -> str:
+    """Rewrite .bib text with entries sorted ascending by bibcode year.
+
+    Splits on blank-line boundaries; ADS bibtex export and this module's
+    own writer both separate entries that way. For each chunk, extracts
+    a bibcode from either a '% ADS bibcode: <X>' comment (rekey'd
+    entries) or the @ENTRY{<X>,...} citekey (raw-bibcode-keyed entries).
+    Chunks without a recognizable bibcode (file-level preamble comments)
+    stay at the top in original order. Sort key is (year, bibcode) so
+    same-year entries land in a deterministic order.
+
+    Assumes entries are separated by at least one blank line, contain no
+    blank lines inside the entry body, and hold at most one @entry per
+    chunk — all true of ADS export and of entries written by this tool.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    text = text.strip()
+    if not text:
+        return ""
+    chunks = re.split(r"\n\s*\n+", text)
+    preamble: list[str] = []
+    entries: list[tuple[int, str, str]] = []
+    for chunk in chunks:
+        m = re.search(r"%\s*ADS bibcode:\s*(\d{4}\S{15})", chunk)
+        if not m:
+            m = re.search(r"@\w+\s*\{\s*(\d{4}\S{15})\s*,", chunk)
+        if m:
+            bibcode = m.group(1)
+            entries.append((int(bibcode[:4]), bibcode, chunk))
+        else:
+            preamble.append(chunk)
+    entries.sort(key=lambda t: (t[0], t[1]))
+    parts = preamble + [c for (_, _, c) in entries]
+    return "\n\n".join(parts) + "\n"
+
+
 def cmd_bibtex(bibcodes: list[str], json_out: bool,
                rekey: bool = False, subject: Optional[str] = None) -> None:
     """Export verbatim bibtex entries for one or more bibcodes via the ADS
@@ -453,6 +490,12 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
     exists. Creates the file if missing. With --rekey, citekeys become
     LastName_Subject_Year and the bibcode is preserved as a comment.
 
+    After any write, the whole file is rewritten in ascending chronological
+    order (by bibcode year), so new papers land at the bottom and older
+    backfills slot into place. Running append on an unchanged set of
+    bibcodes is still cheap, and self-heals any file whose order has
+    drifted from chronological.
+
     Tool spec: { bibfile: string (path), bibcodes: array<string>, json?: bool,
                  rekey?: bool, subject?: string }
     """
@@ -477,12 +520,16 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
         # (b) '% ADS bibcode: <X>' comments (rekey'd entries).
         existing_bibcodes.update(
             re.findall(r"@\w+\s*\{\s*([^,\s]+)", existing_text))
+        # Constrain to the bibcode format so a trailing user note on the
+        # same line (e.g., '% ADS bibcode: 2016ApJS..224....3N — cited in §2')
+        # doesn't leak into the captured identifier.
         existing_bibcodes.update(
-            re.findall(r"%\s*ADS bibcode:\s*(\S+)", existing_text))
+            re.findall(r"%\s*ADS bibcode:\s*(\d{4}\S{15})", existing_text))
     new = [b for b in bibcodes if b not in existing_bibcodes]
     skipped = [b for b in bibcodes if b in existing_bibcodes]
     result: dict = {"bibfile": str(path), "added": new, "skipped": skipped}
 
+    combined = existing_text
     if new:
         token = get_token()
         data = api_post("/export/bibtex", {"bibcode": new}, token)
@@ -492,20 +539,25 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
         if rekey:
             entries = _split_bibtex_entries(export)
             export = "\n\n".join(_rekey_bibtex(e, subject) for e in entries)
-        # Ensure at least one blank line separates old content from new.
-        if not existing_text:
+        # Ensure at least one blank line separates old content from new
+        # before the chronological sort parses the combined text.
+        if not combined:
             sep = ""
-        elif existing_text.endswith("\n\n"):
+        elif combined.endswith("\n\n"):
             sep = ""
-        elif existing_text.endswith("\n"):
+        elif combined.endswith("\n"):
             sep = "\n"
         else:
             sep = "\n\n"
-        # Create parent dir if missing (typical when starting a new proposal).
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
-            f.write(sep + export + "\n")
+        combined = combined + sep + export + "\n"
         result["bibtex_written"] = export
+
+    sorted_text = _sort_bib_chronologically(combined) if combined else ""
+    reordered = bool(sorted_text) and sorted_text != existing_text and not new
+    if new or reordered:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(sorted_text)
+    result["reordered"] = reordered
 
     if json_out:
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -518,6 +570,8 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
         print(f"Skipped {len(skipped)} already-present entry(ies):")
         for b in skipped:
             print(f"  = {b}")
+    if reordered:
+        print("Reordered file chronologically.")
     if not new and not skipped:
         print("Nothing to do.")
 
