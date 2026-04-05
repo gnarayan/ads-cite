@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ads-cite"
+version = "0.1.0"
+description = "NASA ADS search + verbatim bibtex export CLI, installable as a Claude Code skill or standalone tool"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Gautham Narayan" }]
+keywords = ["astronomy", "astrophysics", "nasa-ads", "bibtex", "claude-code", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/gnarayan/ads-cite"
+Repository = "https://github.com/gnarayan/ads-cite"
+Issues = "https://github.com/gnarayan/ads-cite/issues"
+
+[project.scripts]
+ads-cite = "ads_cite:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["ads_cite.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["ads_cite.py", "SKILL.md", "README.md", "LICENSE", "pyproject.toml"]

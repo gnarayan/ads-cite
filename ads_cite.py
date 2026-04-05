@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Helper for the /ads-cite skill — wraps ADS search, record detail, bibtex
-export, and citation lookup so the skill only needs one whitelisted Bash
-permission instead of separate curl + python3 invocations.
+export, citation lookup, arXiv/DOI resolution, and .bib-file append so an
+agent framework only needs one whitelisted permission instead of separate
+curl + python3 invocations.
 
 Usage:
-  ads.py search "<QUERY>"              search ADS; print numbered results
-  ads.py show <BIBCODE>                print full record for one bibcode
-  ads.py bibtex <BIBCODE> [<BIBCODE>]  print bibtex entries (verbatim ADS)
-  ads.py citations <BIBCODE>           list papers that cite this bibcode
-  ads.py arxiv <ID>                    resolve arXiv ID (prefers refereed version)
-  ads.py doi <DOI>                     resolve DOI to bibcode
+  ads_cite.py search "<QUERY>"              search ADS; print numbered results
+  ads_cite.py show <BIBCODE>                print full record for one bibcode
+  ads_cite.py bibtex <BIBCODE> [<BIBCODE>]  print bibtex entries (verbatim ADS)
+  ads_cite.py citations <BIBCODE>           list papers that cite this bibcode
+  ads_cite.py references <BIBCODE>          list papers cited by this bibcode
+  ads_cite.py arxiv <ID>                    resolve arXiv ID (prefers refereed version)
+  ads_cite.py doi <DOI>                     resolve DOI to bibcode
+  ads_cite.py append <BIBFILE> <BIBCODE>... append bibtex to a .bib file
+                                            (skips bibcodes already present)
 
-Query syntax (search/citations):
+Flags (apply where meaningful):
+  --json             emit machine-readable JSON instead of formatted text
+  --rows N           cap on returned results (search/citations/references)
+  --sort FIELD DIR   override sort, e.g. --sort "citation_count desc"
+
+Query syntax (search/citations/references):
   author:"Narayan, G."     author (use ^Name for first author only)
   first_author:"Name, G."  first author (alternative to ^)
   title:"dark energy"      phrase in title
@@ -34,6 +43,7 @@ ADS API token — searched in this order:
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -46,6 +56,9 @@ from pathlib import Path
 
 ADS = "https://api.adsabs.harvard.edu/v1"
 BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
+
+# Fields returned for list-style output (search / citations / references / arxiv / doi)
+LIST_FL = "bibcode,title,author,year,citation_count,pub"
 
 
 def _die(msg: str) -> None:
@@ -114,13 +127,11 @@ def get_token() -> str:
         token = keyfile.read_text().strip().splitlines()[0].strip()
         if token:
             return token
-    sys.exit(
-        "ERROR: ADS token not found. Set one of:\n"
-        "  - macOS keychain: security add-generic-password -a \"$USER\" "
-        "-s \"nasa-ads-api-token\" -w \"<TOKEN>\" -U\n"
-        "  - Env var: export ADS_DEV_KEY=<TOKEN>\n"
-        "  - File: echo <TOKEN> > ~/.ads/dev_key && chmod 600 ~/.ads/dev_key"
-    )
+    _die("ADS token not found. Set one of:\n"
+         "  - macOS keychain: security add-generic-password -a \"$USER\" "
+         "-s \"nasa-ads-api-token\" -w \"<TOKEN>\" -U\n"
+         "  - Env var: export ADS_DEV_KEY=<TOKEN>\n"
+         "  - File: echo <TOKEN> > ~/.ads/dev_key && chmod 600 ~/.ads/dev_key")
 
 
 def api_get(path: str, params: list[tuple[str, str]], token: str) -> dict:
@@ -142,8 +153,11 @@ def api_post(path: str, body: dict, token: str) -> dict:
     return _http_call(req)
 
 
-def _print_results(docs: list[dict]) -> None:
-    """Format a list of ADS result docs as a numbered, human-readable list."""
+def _print_results(docs: list[dict], json_out: bool = False) -> None:
+    """Format a list of ADS result docs as a numbered list, or emit JSON."""
+    if json_out:
+        print(json.dumps(docs, indent=2, ensure_ascii=False))
+        return
     if not docs:
         print("No results.")
         return
@@ -159,31 +173,63 @@ def _print_results(docs: list[dict]) -> None:
               f'| {p.get("bibcode","?")}\n')
 
 
-def cmd_search(query: str) -> None:
-    """Search NASA ADS and print up to 10 results sorted by date.
-
-    Tool spec: { query: string (ADS field:value syntax, AND-joined) }
-    """
-    # Filter to astronomy DB and to journal articles + arXiv preprints —
-    # excludes AAS meeting abstracts, conference proceedings, PhD theses.
+def _list_search(query: str, default_sort: str, default_rows: int,
+                 rows, sort, json_out: bool, extra_fl: str = "") -> None:
+    """Shared implementation for search/citations/references: applies filters,
+    rows/sort overrides, emits results as text or JSON."""
     token = get_token()
+    fl = LIST_FL + (f",{extra_fl}" if extra_fl else "")
     params = [
         ("q", query),
         ("fq", "database:astronomy"),
         ("fq", "doctype:(article OR eprint)"),
-        ("fl", "bibcode,title,author,year,citation_count,pub"),
-        ("sort", "date desc"),
-        ("rows", "10"),
+        ("fl", fl),
+        ("sort", sort or default_sort),
+        ("rows", str(rows or default_rows)),
     ]
     data = api_get("/search/query", params, token)
-    _print_results(data.get("response", {}).get("docs", []))
+    _print_results(data.get("response", {}).get("docs", []), json_out)
 
 
-def cmd_show(bibcode: str) -> None:
+def cmd_search(query: str, rows, sort, json_out: bool) -> None:
+    """Search NASA ADS and print up to 10 (or --rows N) results.
+
+    Filter to astronomy DB and to journal articles + arXiv preprints —
+    excludes AAS meeting abstracts, conference proceedings, PhD theses.
+
+    Tool spec: { query: string, rows?: int, sort?: string, json?: bool }
+    """
+    _list_search(query, "date desc", 10, rows, sort, json_out)
+
+
+def cmd_citations(bibcode: str, rows, sort, json_out: bool) -> None:
+    """List the top 20 (or --rows N) papers citing the given bibcode.
+
+    Uses ADS's citations() query operator, which returns the set of papers
+    citing the matches of its inner query.
+
+    Tool spec: { bibcode: string, rows?: int, sort?: string, json?: bool }
+    """
+    _list_search(f"citations(bibcode:{bibcode})",
+                 "citation_count desc", 20, rows, sort, json_out)
+
+
+def cmd_references(bibcode: str, rows, sort, json_out: bool) -> None:
+    """List papers referenced by (cited in) the given bibcode.
+
+    Uses ADS's references() query operator — the complement of citations().
+
+    Tool spec: { bibcode: string, rows?: int, sort?: string, json?: bool }
+    """
+    _list_search(f"references(bibcode:{bibcode})",
+                 "date desc", 50, rows, sort, json_out)
+
+
+def cmd_show(bibcode: str, json_out: bool) -> None:
     """Print the full ADS record for one bibcode: title, author list, pub,
     year, DOI, citations, ADS URL, keywords, abstract.
 
-    Tool spec: { bibcode: string (19-char ADS bibcode) }
+    Tool spec: { bibcode: string, json?: bool }
     """
     token = get_token()
     params = [
@@ -196,6 +242,9 @@ def cmd_show(bibcode: str) -> None:
     if not docs:
         _die(f"No ADS record found for bibcode: {bibcode}")
     p = docs[0]
+    if json_out:
+        print(json.dumps(p, indent=2, ensure_ascii=False))
+        return
     authors = p.get("author", ["?"])
     title = p.get("title", ["?"])[0]
     print(f"Title:    {title}")
@@ -213,11 +262,11 @@ def cmd_show(bibcode: str) -> None:
     print(p.get("abstract", "(no abstract available)"))
 
 
-def cmd_bibtex(bibcodes: list[str]) -> None:
+def cmd_bibtex(bibcodes: list[str], json_out: bool) -> None:
     """Export verbatim bibtex entries for one or more bibcodes via the ADS
     export endpoint. Output is suitable for direct append to a .bib file.
 
-    Tool spec: { bibcodes: array<string>, max length 2000 }
+    Tool spec: { bibcodes: array<string>, max length 2000, json?: bool }
     """
     if len(bibcodes) > BIBTEX_MAX:
         _die(f"ADS export endpoint accepts at most {BIBTEX_MAX} bibcodes per "
@@ -227,21 +276,24 @@ def cmd_bibtex(bibcodes: list[str]) -> None:
     export = data.get("export", "")
     if not export:
         _die(f"ADS returned no bibtex for: {', '.join(bibcodes)}")
-    print(export, end="")
+    if json_out:
+        print(json.dumps({"bibtex": export}, indent=2))
+    else:
+        print(export, end="")
 
 
-def cmd_arxiv(arxiv_id: str) -> None:
+def cmd_arxiv(arxiv_id: str, json_out: bool) -> None:
     """Resolve an arXiv ID to an ADS record, preferring the refereed version
     over the preprint when both are indexed.
 
-    Tool spec: { arxiv_id: string (e.g. '2510.07637', with or without 'arXiv:' prefix) }
+    Tool spec: { arxiv_id: string, json?: bool }
     """
     token = get_token()
     # strip any leading "arXiv:" prefix; keep bare ID
     arxiv_id = arxiv_id.removeprefix("arXiv:").removeprefix("arxiv:").strip()
     params = [
         ("q", f"identifier:arXiv:{arxiv_id}"),
-        ("fl", "bibcode,title,author,year,citation_count,pub,doctype"),
+        ("fl", f"{LIST_FL},doctype"),
         # Lexicographic sort on doctype puts "article" before "eprint",
         # so any refereed version surfaces ahead of the preprint.
         ("sort", "doctype asc,date desc"),
@@ -251,53 +303,83 @@ def cmd_arxiv(arxiv_id: str) -> None:
     docs = data.get("response", {}).get("docs", [])
     if not docs:
         _die(f"No ADS record found for arXiv:{arxiv_id}")
-    # Flag refereed vs preprint
-    refereed = [d for d in docs if d.get("doctype") == "article"]
-    preprints = [d for d in docs if d.get("doctype") == "eprint"]
-    if refereed and preprints:
-        print(f"Refereed version available (preferred); preprint also in ADS.\n")
-    elif preprints and not refereed:
-        print(f"Only preprint found on ADS (no refereed version yet).\n")
-    _print_results(docs)
+    if not json_out:
+        refereed = [d for d in docs if d.get("doctype") == "article"]
+        preprints = [d for d in docs if d.get("doctype") == "eprint"]
+        if refereed and preprints:
+            print("Refereed version available (preferred); preprint also in ADS.\n")
+        elif preprints and not refereed:
+            print("Only preprint found on ADS (no refereed version yet).\n")
+    _print_results(docs, json_out)
 
 
-def cmd_doi(doi: str) -> None:
+def cmd_doi(doi: str, json_out: bool) -> None:
     """Resolve a DOI to an ADS bibcode.
 
-    Tool spec: { doi: string (e.g. '10.3847/0067-0049/224/1/3') }
+    Tool spec: { doi: string, json?: bool }
     """
     token = get_token()
     params = [
         ("q", f'doi:"{doi}"'),
-        ("fl", "bibcode,title,author,year,citation_count,pub"),
+        ("fl", LIST_FL),
         ("rows", "5"),
     ]
     data = api_get("/search/query", params, token)
     docs = data.get("response", {}).get("docs", [])
     if not docs:
         _die(f"No ADS record found for DOI: {doi}")
-    _print_results(docs)
+    _print_results(docs, json_out)
 
 
-def cmd_citations(bibcode: str) -> None:
-    """List the top 20 papers citing the given bibcode, sorted by citation
-    count. Use for literature review or impact assessment.
+def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
+    """Append verbatim ADS bibtex entries to a .bib file, skipping any
+    bibcode whose citekey already exists. Creates the file if missing.
 
-    Tool spec: { bibcode: string }
+    Tool spec: { bibfile: string (path), bibcodes: array<string>, json?: bool }
     """
-    # ADS's citations() query operator returns the set of papers citing the
-    # matches of its inner query — here, the single record with this bibcode.
-    token = get_token()
-    params = [
-        ("q", f"citations(bibcode:{bibcode})"),
-        ("fq", "database:astronomy"),
-        ("fq", "doctype:(article OR eprint)"),
-        ("fl", "bibcode,title,author,year,citation_count,pub"),
-        ("sort", "citation_count desc"),
-        ("rows", "20"),
-    ]
-    data = api_get("/search/query", params, token)
-    _print_results(data.get("response", {}).get("docs", []))
+    path = Path(bibfile).expanduser()
+    existing: set = set()
+    existing_text = ""
+    if path.exists():
+        existing_text = path.read_text()
+        # Match @TYPE{citekey, — citekey is everything up to the comma.
+        existing = set(re.findall(r'@\w+\s*\{\s*([^,\s]+)', existing_text))
+    new = [b for b in bibcodes if b not in existing]
+    skipped = [b for b in bibcodes if b in existing]
+    result = {"bibfile": str(path), "added": new, "skipped": skipped}
+
+    if new:
+        token = get_token()
+        data = api_post("/export/bibtex", {"bibcode": new}, token)
+        export = data.get("export", "").rstrip()
+        if not export:
+            _die(f"ADS returned no bibtex for: {', '.join(new)}")
+        # Ensure at least one blank line separates old content from new.
+        sep = ""
+        if existing_text:
+            if existing_text.endswith("\n\n"):
+                sep = ""
+            elif existing_text.endswith("\n"):
+                sep = "\n"
+            else:
+                sep = "\n\n"
+        with path.open("a") as f:
+            f.write(sep + export + "\n")
+        result["bibtex_written"] = export
+
+    if json_out:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    if new:
+        print(f"Appended {len(new)} entry(ies) to {path}:")
+        for b in new:
+            print(f"  + {b}")
+    if skipped:
+        print(f"Skipped {len(skipped)} already-present entry(ies):")
+        for b in skipped:
+            print(f"  = {b}")
+    if not new and not skipped:
+        print("Nothing to do.")
 
 
 def usage(exit_code: int = 0) -> None:
@@ -306,24 +388,56 @@ def usage(exit_code: int = 0) -> None:
     sys.exit(exit_code)
 
 
+def _parse_flags(args: list[str]):
+    """Extract --json, --rows N, --sort 'field dir' from an arg list.
+    Returns (flags_dict, remaining_positional_args)."""
+    flags = {"json": False, "rows": None, "sort": None}
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--json":
+            flags["json"] = True
+        elif a == "--rows" and i + 1 < len(args):
+            try:
+                flags["rows"] = int(args[i + 1])
+            except ValueError:
+                _die(f"--rows expects an integer, got {args[i+1]!r}")
+            i += 1
+        elif a == "--sort" and i + 1 < len(args):
+            flags["sort"] = args[i + 1]
+            i += 1
+        else:
+            remaining.append(a)
+        i += 1
+    return flags, remaining
+
+
 def main() -> None:
     """Parse argv and dispatch to the matching cmd_* function."""
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         usage(0)
     cmd = sys.argv[1]
-    args = sys.argv[2:]
+    flags, args = _parse_flags(sys.argv[2:])
+    j = flags["json"]
+    r = flags["rows"]
+    s = flags["sort"]
     if cmd == "search" and len(args) == 1:
-        cmd_search(args[0])
+        cmd_search(args[0], r, s, j)
     elif cmd == "show" and len(args) == 1:
-        cmd_show(args[0])
+        cmd_show(args[0], j)
     elif cmd == "bibtex" and len(args) >= 1:
-        cmd_bibtex(args)
+        cmd_bibtex(args, j)
     elif cmd == "citations" and len(args) == 1:
-        cmd_citations(args[0])
+        cmd_citations(args[0], r, s, j)
+    elif cmd == "references" and len(args) == 1:
+        cmd_references(args[0], r, s, j)
     elif cmd == "arxiv" and len(args) == 1:
-        cmd_arxiv(args[0])
+        cmd_arxiv(args[0], j)
     elif cmd == "doi" and len(args) == 1:
-        cmd_doi(args[0])
+        cmd_doi(args[0], j)
+    elif cmd == "append" and len(args) >= 2:
+        cmd_append(args[0], args[1:], j)
     else:
         usage(1)
 
