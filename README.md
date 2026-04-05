@@ -1,6 +1,6 @@
 # ads-cite
 
-A [Claude Code](https://docs.claude.com/claude-code) skill and standalone CLI for searching NASA ADS, fetching records, and exporting verbatim bibtex straight into a `.bib` file.
+A [Claude Code](https://docs.claude.com/claude-code) skill and standalone CLI for searching NASA ADS, fetching records, and exporting verbatim bibtex into a `.bib` file.
 
 ## Why
 
@@ -15,30 +15,28 @@ Writing astronomy/astrophysics papers and proposals means citing a lot of ADS-in
 
 `ads_cite.py` is also a self-contained CLI usable without Claude Code (pip-installable as `ads-cite`).
 
-## Install — as a Claude Code skill
+## Install
 
-Requires [Claude Code](https://docs.claude.com/claude-code) and Python 3.9+ (standard library only, no extra dependencies).
+Requires Python 3.9+. Standard library only; no extra dependencies.
 
+**As a Claude Code skill:**
 ```bash
 git clone https://github.com/gnarayan/ads-cite.git ~/.claude/skills/ads-cite
 ```
-
 Claude Code picks up the skill automatically on next session. Verify with `/skills` or invoke `/ads-cite help`.
 
-## Install — as a standalone CLI (via pip)
-
+**As a standalone CLI** (installs `ads-cite` on your PATH, no Claude Code required):
 ```bash
 pip install git+https://github.com/gnarayan/ads-cite.git
-# or once on PyPI:
-# pip install ads-cite
+# or once on PyPI: pip install ads-cite
 ads-cite --help
 ```
 
-This installs the `ads-cite` command on your PATH without touching Claude Code.
+Both paths share the same token config (next section). If you install as a skill, also grant the permission described further below.
 
 ## Configure your ADS API token
 
-Get a token from https://ui.adsabs.harvard.edu → Account Settings → API Token. The script looks for it in this order (first match wins):
+Get a token from https://ui.adsabs.harvard.edu → Account Settings → API Token. ADS allows 5000 API calls/day per token; a search + bibtex export is 2 calls. The script looks for the token in this order (first match wins):
 
 1. **macOS Keychain** (recommended on Mac):
    ```bash
@@ -62,7 +60,7 @@ Add this line to `~/.claude/settings.local.json` under `permissions.allow` so Cl
 "Bash(python3 ~/.claude/skills/ads-cite/ads_cite.py:*)"
 ```
 
-## Teach Claude to actually use it (important)
+## Configure Claude's bibliography behavior
 
 Installing the skill is not enough. Claude defaults to writing bibtex from
 memory when asked for a citation, and it **will hallucinate** journal names,
@@ -218,10 +216,6 @@ Check the input for silent mangling:
 **Preprint returned when you wanted the refereed version** — `arxiv` subcommand already prefers articles over eprints. For direct `search`, if you see an `arXiv` bibcode, check ADS for a linked published version.
 
 **Matching existing `.bib` convention** — if the file already has entries keyed by raw bibcode, drop `--rekey` to keep the file consistent.
-
-## Rate limits
-
-ADS allows 5000 API queries/day per token. A single search + bibtex export is ~2 requests.
 
 ## License
 
