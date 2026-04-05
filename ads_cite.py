@@ -270,20 +270,87 @@ def cmd_show(bibcode: str, json_out: bool) -> None:
     print(p.get("abstract", "(no abstract available)"))
 
 
-def cmd_bibtex(bibcodes: list[str], json_out: bool) -> None:
-    """Export verbatim bibtex entries for one or more bibcodes via the ADS
-    export endpoint. Output is suitable for direct append to a .bib file.
+_TITLE_STOPWORDS = {
+    "The", "And", "With", "From", "Using", "Type", "Survey", "Sample", "Data",
+    "New", "Results", "Paper", "First", "Second", "Third", "For", "Into",
+    "Over", "Under", "Their", "Its", "This", "That", "Which", "When", "Where",
+}
 
-    Tool spec: { bibcodes: array<string>, max length 2000, json?: bool }
+
+def _derive_subject(title: str) -> str:
+    """Pick a memorable subject word from a paper title. Prefers UPPERCASE
+    acronyms (3+ chars); falls back to the longest capitalized non-stopword."""
+    # Strip LaTeX braces and commands
+    clean = re.sub(r"\\[a-zA-Z]+|[{}]", "", title)
+    # UPPERCASE acronyms of 3+ chars (ESSENCE, PLCK, LSST, DESC...)
+    acronyms = re.findall(r"\b[A-Z][A-Z0-9]{2,}\b", clean)
+    if acronyms:
+        return acronyms[0]
+    # Fall back: longest capitalized word that isn't a stopword
+    caps = re.findall(r"\b[A-Z][a-zA-Z]{3,}\b", clean)
+    caps = [w for w in caps if w not in _TITLE_STOPWORDS]
+    if caps:
+        return max(caps, key=len)
+    return "Paper"
+
+
+def _rekey_bibtex(bibtex: str, subject: Optional[str] = None) -> str:
+    """Transform an ADS bibtex block to use LastName_Subject_Year as the
+    citekey. Prepends a '% ADS bibcode: <bibcode>' comment so the original
+    identifier is never lost and dedup remains robust."""
+    m = re.search(r"@(\w+)\s*\{\s*([^,\s]+)\s*,", bibtex)
+    if not m:
+        return bibtex  # unrecognizable, return as-is
+    bibcode = m.group(2)
+    author_m = re.search(r"author\s*=\s*\{\s*\{([^}]+)\}", bibtex)
+    lastname = re.sub(r"[^A-Za-z]", "", author_m.group(1)) if author_m else "Unknown"
+    year_m = re.search(r"year\s*=\s*(\d{4})", bibtex)
+    year = year_m.group(1) if year_m else "XXXX"
+    if not subject:
+        title_m = re.search(r'title\s*=\s*"?\s*\{(.*?)\}"?,', bibtex, re.DOTALL)
+        subject = _derive_subject(title_m.group(1) if title_m else "")
+    subject = re.sub(r"[^A-Za-z0-9]", "", subject)
+    new_key = f"{lastname}_{subject}_{year}"
+    rewritten = re.sub(
+        r"(@\w+\s*\{)\s*[^,\s]+\s*,",
+        lambda mm: f"{mm.group(1)}{new_key},",
+        bibtex, count=1,
+    )
+    return f"% ADS bibcode: {bibcode}\n{rewritten}"
+
+
+def _split_bibtex_entries(export: str) -> list[str]:
+    """Split an ADS bibtex export string into individual @ARTICLE{...} blocks."""
+    # Entries start with @ at column 0 and end before the next @ or EOF.
+    entries = re.findall(r"@\w+\s*\{[^@]+", export)
+    return [e.rstrip() for e in entries]
+
+
+def cmd_bibtex(bibcodes: list[str], json_out: bool,
+               rekey: bool = False, subject: Optional[str] = None) -> None:
+    """Export verbatim bibtex entries for one or more bibcodes via the ADS
+    export endpoint. With --rekey, rewrites the citekey to LastName_Subject_Year
+    and prepends a '% ADS bibcode:' comment preserving the original identifier.
+
+    Tool spec: { bibcodes: array<string>, max length 2000, json?: bool,
+                 rekey?: bool, subject?: string }
     """
     if len(bibcodes) > BIBTEX_MAX:
         _die(f"ADS export endpoint accepts at most {BIBTEX_MAX} bibcodes per "
              f"request; got {len(bibcodes)}. Split into multiple calls.")
+    if subject and not rekey:
+        _die("--subject requires --rekey.")
+    if subject and len(bibcodes) > 1:
+        _die("--subject applies to a single bibcode; for batches, omit it "
+             "and let the auto-derive choose per-entry subjects.")
     token = get_token()
     data = api_post("/export/bibtex", {"bibcode": bibcodes}, token)
     export = data.get("export", "")
     if not export:
         _die(f"ADS returned no bibtex for: {', '.join(bibcodes)}")
+    if rekey:
+        entries = _split_bibtex_entries(export)
+        export = "\n\n".join(_rekey_bibtex(e, subject) for e in entries) + "\n"
     if json_out:
         print(json.dumps({"bibtex": export}, indent=2))
     else:
@@ -339,21 +406,35 @@ def cmd_doi(doi: str, json_out: bool) -> None:
     _print_results(docs, json_out)
 
 
-def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
+def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool,
+               rekey: bool = False, subject: Optional[str] = None) -> None:
     """Append verbatim ADS bibtex entries to a .bib file, skipping any
-    bibcode whose citekey already exists. Creates the file if missing.
+    bibcode whose citekey OR preserved '% ADS bibcode:' comment already
+    exists. Creates the file if missing. With --rekey, citekeys become
+    LastName_Subject_Year and the bibcode is preserved as a comment.
 
-    Tool spec: { bibfile: string (path), bibcodes: array<string>, json?: bool }
+    Tool spec: { bibfile: string (path), bibcodes: array<string>, json?: bool,
+                 rekey?: bool, subject?: string }
     """
+    if subject and not rekey:
+        _die("--subject requires --rekey.")
+    if subject and len(bibcodes) > 1:
+        _die("--subject applies to a single bibcode; for batches, omit it "
+             "and let the auto-derive choose per-entry subjects.")
     path = Path(bibfile).expanduser()
-    existing: set[str] = set()
     existing_text = ""
+    existing_bibcodes: set[str] = set()
     if path.exists():
         existing_text = path.read_text()
-        # Match @TYPE{citekey, — citekey is everything up to the comma.
-        existing = set(re.findall(r'@\w+\s*\{\s*([^,\s]+)', existing_text))
-    new = [b for b in bibcodes if b not in existing]
-    skipped = [b for b in bibcodes if b in existing]
+        # Collect identifiers that could match an incoming bibcode, from:
+        # (a) citekeys (old-style entries key'd by bibcode), and
+        # (b) '% ADS bibcode: <X>' comments (rekey'd entries).
+        existing_bibcodes.update(
+            re.findall(r"@\w+\s*\{\s*([^,\s]+)", existing_text))
+        existing_bibcodes.update(
+            re.findall(r"%\s*ADS bibcode:\s*(\S+)", existing_text))
+    new = [b for b in bibcodes if b not in existing_bibcodes]
+    skipped = [b for b in bibcodes if b in existing_bibcodes]
     result: dict = {"bibfile": str(path), "added": new, "skipped": skipped}
 
     if new:
@@ -362,6 +443,9 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
         export = data.get("export", "").rstrip()
         if not export:
             _die(f"ADS returned no bibtex for: {', '.join(new)}")
+        if rekey:
+            entries = _split_bibtex_entries(export)
+            export = "\n\n".join(_rekey_bibtex(e, subject) for e in entries)
         # Ensure at least one blank line separates old content from new.
         if not existing_text:
             sep = ""
@@ -408,6 +492,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="sort order, e.g. 'citation_count desc' or 'date asc'",
     )
 
+    # Rekey flags — shared by bibtex and append.
+    rekey_flags = argparse.ArgumentParser(add_help=False)
+    rekey_flags.add_argument(
+        "--rekey", action="store_true",
+        help="rewrite citekey to LastName_Subject_Year and prepend an "
+             "'% ADS bibcode:' comment preserving the original identifier",
+    )
+    rekey_flags.add_argument(
+        "--subject", default=None, metavar="WORD",
+        help="subject term for --rekey (single bibcode only); "
+             "auto-derived from title if omitted",
+    )
+
     p = argparse.ArgumentParser(
         prog="ads-cite",
         description="NASA ADS CLI: search, export verbatim bibtex, resolve "
@@ -425,7 +522,7 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="full record for one bibcode")
     s.add_argument("bibcode")
 
-    s = sub.add_parser("bibtex", parents=[json_flag],
+    s = sub.add_parser("bibtex", parents=[json_flag, rekey_flags],
                        help="verbatim bibtex for one or more bibcodes")
     s.add_argument("bibcodes", nargs="+", metavar="BIBCODE")
 
@@ -446,7 +543,7 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="resolve DOI to an ADS bibcode")
     s.add_argument("doi", metavar="DOI")
 
-    s = sub.add_parser("append", parents=[json_flag],
+    s = sub.add_parser("append", parents=[json_flag, rekey_flags],
                        help="append bibtex to a .bib file, skipping duplicates")
     s.add_argument("bibfile", help="path to the .bib file (created if missing)")
     s.add_argument("bibcodes", nargs="+", metavar="BIBCODE")
@@ -464,7 +561,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     elif ns.cmd == "show":
         cmd_show(ns.bibcode, ns.json_out)
     elif ns.cmd == "bibtex":
-        cmd_bibtex(ns.bibcodes, ns.json_out)
+        cmd_bibtex(ns.bibcodes, ns.json_out, ns.rekey, ns.subject)
     elif ns.cmd == "citations":
         cmd_citations(ns.bibcode, ns.rows, ns.sort, ns.json_out)
     elif ns.cmd == "references":
@@ -474,7 +571,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     elif ns.cmd == "doi":
         cmd_doi(ns.doi, ns.json_out)
     elif ns.cmd == "append":
-        cmd_append(ns.bibfile, ns.bibcodes, ns.json_out)
+        cmd_append(ns.bibfile, ns.bibcodes, ns.json_out, ns.rekey, ns.subject)
 
 
 if __name__ == "__main__":

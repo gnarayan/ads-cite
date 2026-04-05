@@ -80,11 +80,14 @@ Paste this into your `~/.claude/CLAUDE.md` (create the file if it doesn't exist)
   citations in `.tex`.
 - **Workflow:** use the `/ads-cite` skill (or `ads-cite` CLI directly) to
   search ADS, pick the result, then either:
-  - `ads-cite append <BIBFILE> <BIBCODE>` — appends verbatim bibtex to the
-    `.bib` file and skips bibcodes already present
-  - `ads-cite bibtex <BIBCODE>` — prints bibtex for paste-in
-- The cite key IS the ADS bibcode (e.g., `\citep{2016ApJS..224....3N}`).
-  No URL comment needed — the ADS URL is in the bibtex `adsurl` field.
+  - `ads-cite append --rekey <BIBFILE> <BIBCODE>` — appends verbatim bibtex
+    with a memorable `LastName_Subject_Year` citekey and preserves the
+    original bibcode as a `% ADS bibcode:` comment; skips duplicates
+  - `ads-cite bibtex --rekey <BIBCODE>` — prints bibtex for paste-in
+- With `--rekey`, cite as `\citep{Narayan_ESSENCE_2016}`. Without it, the
+  citekey is the raw bibcode (`\citep{2016ApJS..224....3N}`). Match whatever
+  convention the existing `.bib` file already uses. No URL comment needed —
+  the ADS URL is in the bibtex `adsurl` field.
 ```
 
 With this in place, when you ask Claude for a citation or to add references
@@ -128,6 +131,33 @@ ads-cite --help
 | `--json` | all verbs | Emit structured JSON instead of formatted text. Useful for scripts and agent tool calls. |
 | `--rows N` | `search`, `citations`, `references` | Override the default row cap (10 / 20 / 50). |
 | `--sort "FIELD DIR"` | `search`, `citations`, `references` | Override sort, e.g. `--sort "citation_count desc"`. |
+| `--rekey` | `bibtex`, `append` | Rewrite citekey as `LastName_Subject_Year` (e.g., `Narayan_ESSENCE_2016`). Prepends `% ADS bibcode: <X>` as a comment, so the original identifier is preserved and dedup still works across both styles. |
+| `--subject WORD` | `bibtex`, `append` (with `--rekey`) | Explicit subject for the citekey. Single-bibcode only. If omitted, auto-derived from the title (prefers uppercase acronyms like ESSENCE, PLCK, LSST). |
+
+### Memorable citekeys with `--rekey`
+
+ADS bibcodes (`2016ApJS..224....3N`) are unambiguous but hard to type or remember when you're citing a paper by name. `--rekey` transforms each entry to a human-friendly citekey while keeping the bibcode safe:
+
+```bash
+# Auto-derive subject from title
+$ ads-cite bibtex --rekey 2016ApJS..224....3N
+% ADS bibcode: 2016ApJS..224....3N
+@ARTICLE{Narayan_ESSENCE_2016,
+  ...
+}
+
+# Explicit subject override
+$ ads-cite bibtex --rekey --subject SN2023ixf 2024ApJ...XXX..YYYZ
+% ADS bibcode: 2024ApJ...XXX..YYYZ
+@ARTICLE{Author_SN2023ixf_2024,
+  ...
+}
+
+# Append with rekey — your .tex file uses \citep{Narayan_ESSENCE_2016}
+$ ads-cite append --rekey refs.bib 2016ApJS..224....3N
+```
+
+Dedup is robust across styles: if you've already appended a bibcode with `--rekey`, appending the same bibcode later (with or without `--rekey`) will skip it, because the bibcode lives in the preserved `% ADS bibcode:` comment.
 
 ### Examples
 

@@ -25,7 +25,7 @@ The script finds the ADS token in this order: macOS Keychain (service `nasa-ads-
 | `doi <DOI>` | Resolve DOI to ADS bibcode |
 | `append <BIBFILE> <BIBCODE>...` | Append bibtex to a .bib file, skipping duplicates |
 
-Flags: `--json` (machine-readable output), `--rows N`, `--sort "FIELD DIR"`.
+Flags: `--json` (machine-readable output), `--rows N`, `--sort "FIELD DIR"`, `--rekey` + `--subject WORD` (rewrite citekey as `LastName_Subject_Year`).
 
 ## Parse the user's query
 
@@ -60,13 +60,18 @@ Join with implicit AND spaces:
 
 2. **Append to .bib** (preferred when a `.bib` exists in CWD):
    ```bash
-   python3 ~/.claude/skills/ads-cite/ads_cite.py append <BIBFILE> <BIBCODE>...
+   python3 ~/.claude/skills/ads-cite/ads_cite.py append --rekey <BIBFILE> <BIBCODE>...
    ```
-   Deduplicates against existing citekeys in the file. Creates the file if missing.
+   `--rekey` rewrites the citekey from the raw bibcode to `LastName_Subject_Year`
+   (e.g., `Narayan_ESSENCE_2016`) and prepends `% ADS bibcode: <X>` as a comment
+   so the original identifier is preserved and dedup still works. Pick a good
+   `--subject` word from the paper title; if omitted, ads-cite auto-derives one
+   (prefers uppercase acronyms in the title). Check the existing `.bib` — if it
+   uses raw-bibcode citekeys, drop `--rekey` to match the file's convention.
 
-3. **Or print bibtex** for paste-in:
+3. **Or print bibtex** for paste-in (same `--rekey` / `--subject` flags apply):
    ```bash
-   python3 ~/.claude/skills/ads-cite/ads_cite.py bibtex <BIBCODE> [<BIBCODE2>...]
+   python3 ~/.claude/skills/ads-cite/ads_cite.py bibtex --rekey <BIBCODE>
    ```
 
 When both a preprint and a refereed version appear, prefer the refereed one but mention the preprint alternative.
