@@ -36,11 +36,50 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 ADS = "https://api.adsabs.harvard.edu/v1"
+BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
+
+
+def _die(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _http_call(req: urllib.request.Request) -> dict:
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        snippet = ""
+        try:
+            snippet = e.read().decode()[:200].strip().replace("\n", " ")
+        except Exception:
+            pass
+        if e.code == 401:
+            _die("ADS API rejected the token (401). Check it at "
+                 "https://ui.adsabs.harvard.edu → Account Settings → API Token.")
+        elif e.code == 400:
+            _die(f"ADS rejected the query (400 BAD REQUEST): {snippet}")
+        elif e.code == 429:
+            _die("ADS rate limit hit (429). The 5000/day quota is exhausted; "
+                 "try again after UTC midnight or check X-RateLimit headers.")
+        elif e.code >= 500:
+            _die(f"ADS server error ({e.code}). Try again shortly. {snippet}")
+        else:
+            _die(f"ADS returned HTTP {e.code}: {snippet}")
+    except urllib.error.URLError as e:
+        _die(f"Could not reach ADS at {ADS}: {e.reason}")
+    except TimeoutError:
+        _die("Request to ADS timed out after 30 seconds.")
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        _die(f"ADS returned non-JSON response: {body[:200]!r}")
 
 
 def get_token() -> str:
@@ -79,8 +118,7 @@ def get_token() -> str:
 def api_get(path: str, params: list[tuple[str, str]], token: str) -> dict:
     url = f"{ADS}{path}?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    return _http_call(req)
 
 
 def api_post(path: str, body: dict, token: str) -> dict:
@@ -90,11 +128,13 @@ def api_post(path: str, body: dict, token: str) -> dict:
                  "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    return _http_call(req)
 
 
 def _print_results(docs: list[dict]) -> None:
+    if not docs:
+        print("No results.")
+        return
     print(f"Found {len(docs)} results:\n")
     for i, p in enumerate(docs, 1):
         authors = p.get("author", ["?"])
@@ -131,7 +171,7 @@ def cmd_show(bibcode: str) -> None:
     data = api_get("/search/query", params, token)
     docs = data.get("response", {}).get("docs", [])
     if not docs:
-        sys.exit(f"No record found for bibcode: {bibcode}")
+        _die(f"No ADS record found for bibcode: {bibcode}")
     p = docs[0]
     authors = p.get("author", ["?"])
     title = p.get("title", ["?"])[0]
@@ -151,9 +191,15 @@ def cmd_show(bibcode: str) -> None:
 
 
 def cmd_bibtex(bibcodes: list[str]) -> None:
+    if len(bibcodes) > BIBTEX_MAX:
+        _die(f"ADS export endpoint accepts at most {BIBTEX_MAX} bibcodes per "
+             f"request; got {len(bibcodes)}. Split into multiple calls.")
     token = get_token()
     data = api_post("/export/bibtex", {"bibcode": bibcodes}, token)
-    print(data.get("export", ""), end="")
+    export = data.get("export", "")
+    if not export:
+        _die(f"ADS returned no bibtex for: {', '.join(bibcodes)}")
+    print(export, end="")
 
 
 def cmd_arxiv(arxiv_id: str) -> None:
@@ -170,7 +216,7 @@ def cmd_arxiv(arxiv_id: str) -> None:
     data = api_get("/search/query", params, token)
     docs = data.get("response", {}).get("docs", [])
     if not docs:
-        sys.exit(f"No ADS record found for arXiv:{arxiv_id}")
+        _die(f"No ADS record found for arXiv:{arxiv_id}")
     # Flag refereed vs preprint
     refereed = [d for d in docs if d.get("doctype") == "article"]
     preprints = [d for d in docs if d.get("doctype") == "eprint"]
@@ -191,7 +237,7 @@ def cmd_doi(doi: str) -> None:
     data = api_get("/search/query", params, token)
     docs = data.get("response", {}).get("docs", [])
     if not docs:
-        sys.exit(f"No ADS record found for DOI: {doi}")
+        _die(f"No ADS record found for DOI: {doi}")
     _print_results(docs)
 
 
