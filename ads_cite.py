@@ -1,25 +1,41 @@
 #!/usr/bin/env python3
-"""Helper for the /ads-cite skill — wraps ADS search, record detail, bibtex
-export, citation lookup, arXiv/DOI resolution, and .bib-file append so an
-agent framework only needs one whitelisted permission instead of separate
-curl + python3 invocations.
+"""ads-cite — NASA ADS search, bibtex export, citation/reference lookup.
 
-Usage:
-  ads_cite.py search "<QUERY>"              search ADS; print numbered results
-  ads_cite.py show <BIBCODE>                print full record for one bibcode
-  ads_cite.py bibtex <BIBCODE> [<BIBCODE>]  print bibtex entries (verbatim ADS)
-  ads_cite.py citations <BIBCODE>           list papers that cite this bibcode
-  ads_cite.py references <BIBCODE>          list papers cited by this bibcode
-  ads_cite.py arxiv <ID>                    resolve arXiv ID (prefers refereed version)
-  ads_cite.py doi <DOI>                     resolve DOI to bibcode
-  ads_cite.py append <BIBFILE> <BIBCODE>... append bibtex to a .bib file
-                                            (skips bibcodes already present)
+Usable both as a standalone CLI (``ads-cite ...`` after ``pip install``) and
+as the backing script for the /ads-cite Claude Code skill. All API access is
+funneled through this one entry point so an agent framework only needs a
+single whitelisted permission.
 
-Flags (apply where meaningful):
-  --json             emit machine-readable JSON instead of formatted text
-  --rows N           cap on returned results (search/citations/references)
-  --sort FIELD DIR   override sort, e.g. --sort "citation_count desc"
+Run ``ads-cite --help`` for command-line usage; ``ads-cite <command> --help``
+for per-subcommand flags. See the epilog of --help for query syntax and
+token lookup order.
+"""
+from __future__ import annotations
 
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+# Structure: _http_call wraps urllib with ADS-specific error translation;
+# api_{get,post} thin wrappers over it; cmd_* functions are the CLI verbs;
+# _build_parser() defines the argparse schema; main() dispatches.
+
+ADS = "https://api.adsabs.harvard.edu/v1"
+TIMEOUT = 30  # seconds, for every ADS API call
+BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
+
+# Fields returned for list-style output (search / citations / references / arxiv / doi)
+LIST_FL = "bibcode,title,author,year,citation_count,pub"
+
+QUERY_SYNTAX = """\
 Query syntax (search/citations/references):
   author:"Narayan, G."     author (use ^Name for first author only)
   first_author:"Name, G."  first author (alternative to ^)
@@ -33,32 +49,14 @@ Query syntax (search/citations/references):
   bibgroup:DESC            collection/bibgroup (DESC, LSST, etc.)
   grant:"DE-SC0025232"     funding grant ID (useful for proposal prior work)
   arxiv_class:astro-ph.CO  arXiv primary category
-  "GW170817"               quoted phrase (use for object names, compact IDs)
-  Combine fields with spaces (implicit AND). Also OR, NOT, - (negation).
+  "GW170817"               quoted phrase (for object names, compact IDs)
+  Combine fields with spaces (implicit AND). Also OR, NOT, - (negation)."""
 
-ADS API token — searched in this order:
+TOKEN_DOC = """\
+ADS API token is searched in this order:
   1. macOS Keychain: service 'nasa-ads-api-token', account $USER
   2. Environment variable: ADS_DEV_KEY or ADS_API_TOKEN
-  3. File: ~/.ads/dev_key (first line, stripped)
-"""
-import json
-import os
-import re
-import subprocess
-import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
-
-# Structure: _http_call wraps urllib with ADS-specific error translation;
-# api_{get,post} thin wrappers over it; cmd_* functions are the CLI verbs.
-
-ADS = "https://api.adsabs.harvard.edu/v1"
-BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
-
-# Fields returned for list-style output (search / citations / references / arxiv / doi)
-LIST_FL = "bibcode,title,author,year,citation_count,pub"
+  3. File: ~/.ads/dev_key (first line, stripped)"""
 
 
 def _die(msg: str) -> None:
@@ -71,7 +69,7 @@ def _http_call(req: urllib.request.Request) -> dict:
     """Execute an ADS API request; translate all failure modes into clean
     exits. Returns the parsed JSON response on success."""
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             body = resp.read().decode()
     except urllib.error.HTTPError as e:
         snippet = ""
@@ -94,7 +92,7 @@ def _http_call(req: urllib.request.Request) -> dict:
     except urllib.error.URLError as e:
         _die(f"Could not reach ADS at {ADS}: {e.reason}")
     except TimeoutError:
-        _die("Request to ADS timed out after 30 seconds.")
+        _die(f"Request to ADS timed out after {TIMEOUT} seconds.")
     try:
         return json.loads(body)
     except json.JSONDecodeError:
@@ -173,8 +171,15 @@ def _print_results(docs: list[dict], json_out: bool = False) -> None:
               f'| {p.get("bibcode","?")}\n')
 
 
-def _list_search(query: str, default_sort: str, default_rows: int,
-                 rows, sort, json_out: bool, extra_fl: str = "") -> None:
+def _list_search(
+    query: str,
+    default_sort: str,
+    default_rows: int,
+    rows: Optional[int],
+    sort: Optional[str],
+    json_out: bool,
+    extra_fl: str = "",
+) -> None:
     """Shared implementation for search/citations/references: applies filters,
     rows/sort overrides, emits results as text or JSON."""
     token = get_token()
@@ -191,7 +196,8 @@ def _list_search(query: str, default_sort: str, default_rows: int,
     _print_results(data.get("response", {}).get("docs", []), json_out)
 
 
-def cmd_search(query: str, rows, sort, json_out: bool) -> None:
+def cmd_search(query: str, rows: Optional[int], sort: Optional[str],
+               json_out: bool) -> None:
     """Search NASA ADS and print up to 10 (or --rows N) results.
 
     Filter to astronomy DB and to journal articles + arXiv preprints —
@@ -202,7 +208,8 @@ def cmd_search(query: str, rows, sort, json_out: bool) -> None:
     _list_search(query, "date desc", 10, rows, sort, json_out)
 
 
-def cmd_citations(bibcode: str, rows, sort, json_out: bool) -> None:
+def cmd_citations(bibcode: str, rows: Optional[int], sort: Optional[str],
+                  json_out: bool) -> None:
     """List the top 20 (or --rows N) papers citing the given bibcode.
 
     Uses ADS's citations() query operator, which returns the set of papers
@@ -214,7 +221,8 @@ def cmd_citations(bibcode: str, rows, sort, json_out: bool) -> None:
                  "citation_count desc", 20, rows, sort, json_out)
 
 
-def cmd_references(bibcode: str, rows, sort, json_out: bool) -> None:
+def cmd_references(bibcode: str, rows: Optional[int], sort: Optional[str],
+                   json_out: bool) -> None:
     """List papers referenced by (cited in) the given bibcode.
 
     Uses ADS's references() query operator — the complement of citations().
@@ -338,7 +346,7 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
     Tool spec: { bibfile: string (path), bibcodes: array<string>, json?: bool }
     """
     path = Path(bibfile).expanduser()
-    existing: set = set()
+    existing: set[str] = set()
     existing_text = ""
     if path.exists():
         existing_text = path.read_text()
@@ -346,7 +354,7 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
         existing = set(re.findall(r'@\w+\s*\{\s*([^,\s]+)', existing_text))
     new = [b for b in bibcodes if b not in existing]
     skipped = [b for b in bibcodes if b in existing]
-    result = {"bibfile": str(path), "added": new, "skipped": skipped}
+    result: dict = {"bibfile": str(path), "added": new, "skipped": skipped}
 
     if new:
         token = get_token()
@@ -355,14 +363,14 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
         if not export:
             _die(f"ADS returned no bibtex for: {', '.join(new)}")
         # Ensure at least one blank line separates old content from new.
-        sep = ""
-        if existing_text:
-            if existing_text.endswith("\n\n"):
-                sep = ""
-            elif existing_text.endswith("\n"):
-                sep = "\n"
-            else:
-                sep = "\n\n"
+        if not existing_text:
+            sep = ""
+        elif existing_text.endswith("\n\n"):
+            sep = ""
+        elif existing_text.endswith("\n"):
+            sep = "\n"
+        else:
+            sep = "\n\n"
         with path.open("a") as f:
             f.write(sep + export + "\n")
         result["bibtex_written"] = export
@@ -382,64 +390,91 @@ def cmd_append(bibfile: str, bibcodes: list[str], json_out: bool) -> None:
         print("Nothing to do.")
 
 
-def usage(exit_code: int = 0) -> None:
-    """Print the module docstring as help text and exit."""
-    print(__doc__, file=sys.stderr if exit_code else sys.stdout)
-    sys.exit(exit_code)
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the argparse schema for the ads-cite CLI."""
+    # Parent parsers for shared flags — inherited via parents=[...] on subparsers.
+    json_flag = argparse.ArgumentParser(add_help=False)
+    json_flag.add_argument(
+        "--json", action="store_true", dest="json_out",
+        help="emit JSON instead of formatted text",
+    )
+    list_flags = argparse.ArgumentParser(add_help=False)
+    list_flags.add_argument(
+        "--rows", type=int, default=None, metavar="N",
+        help="max results to return",
+    )
+    list_flags.add_argument(
+        "--sort", default=None, metavar="'FIELD DIR'",
+        help="sort order, e.g. 'citation_count desc' or 'date asc'",
+    )
+
+    p = argparse.ArgumentParser(
+        prog="ads-cite",
+        description="NASA ADS CLI: search, export verbatim bibtex, resolve "
+                    "arXiv/DOI, list citations/references, append to .bib files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"{QUERY_SYNTAX}\n\n{TOKEN_DOC}",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    s = sub.add_parser("search", parents=[json_flag, list_flags],
+                       help="search ADS with field syntax")
+    s.add_argument("query", help="ADS query string (see epilog for syntax)")
+
+    s = sub.add_parser("show", parents=[json_flag],
+                       help="full record for one bibcode")
+    s.add_argument("bibcode")
+
+    s = sub.add_parser("bibtex", parents=[json_flag],
+                       help="verbatim bibtex for one or more bibcodes")
+    s.add_argument("bibcodes", nargs="+", metavar="BIBCODE")
+
+    s = sub.add_parser("citations", parents=[json_flag, list_flags],
+                       help="papers citing this bibcode")
+    s.add_argument("bibcode")
+
+    s = sub.add_parser("references", parents=[json_flag, list_flags],
+                       help="papers cited by this bibcode")
+    s.add_argument("bibcode")
+
+    s = sub.add_parser("arxiv", parents=[json_flag],
+                       help="resolve arXiv ID (prefers refereed version)")
+    s.add_argument("arxiv_id", metavar="ID",
+                   help="arXiv ID, with or without 'arXiv:' prefix")
+
+    s = sub.add_parser("doi", parents=[json_flag],
+                       help="resolve DOI to an ADS bibcode")
+    s.add_argument("doi", metavar="DOI")
+
+    s = sub.add_parser("append", parents=[json_flag],
+                       help="append bibtex to a .bib file, skipping duplicates")
+    s.add_argument("bibfile", help="path to the .bib file (created if missing)")
+    s.add_argument("bibcodes", nargs="+", metavar="BIBCODE")
+
+    return p
 
 
-def _parse_flags(args: list[str]):
-    """Extract --json, --rows N, --sort 'field dir' from an arg list.
-    Returns (flags_dict, remaining_positional_args)."""
-    flags = {"json": False, "rows": None, "sort": None}
-    remaining: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--json":
-            flags["json"] = True
-        elif a == "--rows" and i + 1 < len(args):
-            try:
-                flags["rows"] = int(args[i + 1])
-            except ValueError:
-                _die(f"--rows expects an integer, got {args[i+1]!r}")
-            i += 1
-        elif a == "--sort" and i + 1 < len(args):
-            flags["sort"] = args[i + 1]
-            i += 1
-        else:
-            remaining.append(a)
-        i += 1
-    return flags, remaining
+def main(argv: Optional[list[str]] = None) -> None:
+    """Parse argv and dispatch to the matching cmd_* function.
 
-
-def main() -> None:
-    """Parse argv and dispatch to the matching cmd_* function."""
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
-        usage(0)
-    cmd = sys.argv[1]
-    flags, args = _parse_flags(sys.argv[2:])
-    j = flags["json"]
-    r = flags["rows"]
-    s = flags["sort"]
-    if cmd == "search" and len(args) == 1:
-        cmd_search(args[0], r, s, j)
-    elif cmd == "show" and len(args) == 1:
-        cmd_show(args[0], j)
-    elif cmd == "bibtex" and len(args) >= 1:
-        cmd_bibtex(args, j)
-    elif cmd == "citations" and len(args) == 1:
-        cmd_citations(args[0], r, s, j)
-    elif cmd == "references" and len(args) == 1:
-        cmd_references(args[0], r, s, j)
-    elif cmd == "arxiv" and len(args) == 1:
-        cmd_arxiv(args[0], j)
-    elif cmd == "doi" and len(args) == 1:
-        cmd_doi(args[0], j)
-    elif cmd == "append" and len(args) >= 2:
-        cmd_append(args[0], args[1:], j)
-    else:
-        usage(1)
+    Accepts an optional argv list for testability; defaults to sys.argv[1:]."""
+    ns = _build_parser().parse_args(argv)
+    if ns.cmd == "search":
+        cmd_search(ns.query, ns.rows, ns.sort, ns.json_out)
+    elif ns.cmd == "show":
+        cmd_show(ns.bibcode, ns.json_out)
+    elif ns.cmd == "bibtex":
+        cmd_bibtex(ns.bibcodes, ns.json_out)
+    elif ns.cmd == "citations":
+        cmd_citations(ns.bibcode, ns.rows, ns.sort, ns.json_out)
+    elif ns.cmd == "references":
+        cmd_references(ns.bibcode, ns.rows, ns.sort, ns.json_out)
+    elif ns.cmd == "arxiv":
+        cmd_arxiv(ns.arxiv_id, ns.json_out)
+    elif ns.cmd == "doi":
+        cmd_doi(ns.doi, ns.json_out)
+    elif ns.cmd == "append":
+        cmd_append(ns.bibfile, ns.bibcodes, ns.json_out)
 
 
 if __name__ == "__main__":
