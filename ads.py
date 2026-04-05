@@ -49,11 +49,14 @@ BIBTEX_MAX = 2000  # ADS export endpoint per-request limit
 
 
 def _die(msg: str) -> None:
+    """Print an error to stderr and exit with status 1."""
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
 def _http_call(req: urllib.request.Request) -> dict:
+    """Execute an ADS API request; translate all failure modes into clean
+    exits. Returns the parsed JSON response on success."""
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = resp.read().decode()
@@ -86,6 +89,8 @@ def _http_call(req: urllib.request.Request) -> dict:
 
 
 def get_token() -> str:
+    """Locate the ADS API token. Tries macOS Keychain, then env vars
+    (ADS_DEV_KEY / ADS_API_TOKEN), then ~/.ads/dev_key. Exits if none found."""
     # 1. macOS Keychain
     try:
         user = os.environ.get("USER") or subprocess.run(
@@ -119,12 +124,15 @@ def get_token() -> str:
 
 
 def api_get(path: str, params: list[tuple[str, str]], token: str) -> dict:
+    """GET request to an ADS endpoint with a list of (key, value) params.
+    Duplicate keys are allowed (e.g., multiple fq filters)."""
     url = f"{ADS}{path}?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     return _http_call(req)
 
 
 def api_post(path: str, body: dict, token: str) -> dict:
+    """POST request to an ADS endpoint with a JSON body."""
     req = urllib.request.Request(
         f"{ADS}{path}", data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {token}",
@@ -135,6 +143,7 @@ def api_post(path: str, body: dict, token: str) -> dict:
 
 
 def _print_results(docs: list[dict]) -> None:
+    """Format a list of ADS result docs as a numbered, human-readable list."""
     if not docs:
         print("No results.")
         return
@@ -151,6 +160,10 @@ def _print_results(docs: list[dict]) -> None:
 
 
 def cmd_search(query: str) -> None:
+    """Search NASA ADS and print up to 10 results sorted by date.
+
+    Tool spec: { query: string (ADS field:value syntax, AND-joined) }
+    """
     # Filter to astronomy DB and to journal articles + arXiv preprints —
     # excludes AAS meeting abstracts, conference proceedings, PhD theses.
     token = get_token()
@@ -167,6 +180,11 @@ def cmd_search(query: str) -> None:
 
 
 def cmd_show(bibcode: str) -> None:
+    """Print the full ADS record for one bibcode: title, author list, pub,
+    year, DOI, citations, ADS URL, keywords, abstract.
+
+    Tool spec: { bibcode: string (19-char ADS bibcode) }
+    """
     token = get_token()
     params = [
         ("q", f"bibcode:{bibcode}"),
@@ -196,6 +214,11 @@ def cmd_show(bibcode: str) -> None:
 
 
 def cmd_bibtex(bibcodes: list[str]) -> None:
+    """Export verbatim bibtex entries for one or more bibcodes via the ADS
+    export endpoint. Output is suitable for direct append to a .bib file.
+
+    Tool spec: { bibcodes: array<string>, max length 2000 }
+    """
     if len(bibcodes) > BIBTEX_MAX:
         _die(f"ADS export endpoint accepts at most {BIBTEX_MAX} bibcodes per "
              f"request; got {len(bibcodes)}. Split into multiple calls.")
@@ -208,6 +231,11 @@ def cmd_bibtex(bibcodes: list[str]) -> None:
 
 
 def cmd_arxiv(arxiv_id: str) -> None:
+    """Resolve an arXiv ID to an ADS record, preferring the refereed version
+    over the preprint when both are indexed.
+
+    Tool spec: { arxiv_id: string (e.g. '2510.07637', with or without 'arXiv:' prefix) }
+    """
     token = get_token()
     # strip any leading "arXiv:" prefix; keep bare ID
     arxiv_id = arxiv_id.removeprefix("arXiv:").removeprefix("arxiv:").strip()
@@ -234,6 +262,10 @@ def cmd_arxiv(arxiv_id: str) -> None:
 
 
 def cmd_doi(doi: str) -> None:
+    """Resolve a DOI to an ADS bibcode.
+
+    Tool spec: { doi: string (e.g. '10.3847/0067-0049/224/1/3') }
+    """
     token = get_token()
     params = [
         ("q", f'doi:"{doi}"'),
@@ -248,6 +280,11 @@ def cmd_doi(doi: str) -> None:
 
 
 def cmd_citations(bibcode: str) -> None:
+    """List the top 20 papers citing the given bibcode, sorted by citation
+    count. Use for literature review or impact assessment.
+
+    Tool spec: { bibcode: string }
+    """
     # ADS's citations() query operator returns the set of papers citing the
     # matches of its inner query — here, the single record with this bibcode.
     token = get_token()
@@ -264,11 +301,13 @@ def cmd_citations(bibcode: str) -> None:
 
 
 def usage(exit_code: int = 0) -> None:
+    """Print the module docstring as help text and exit."""
     print(__doc__, file=sys.stderr if exit_code else sys.stdout)
     sys.exit(exit_code)
 
 
 def main() -> None:
+    """Parse argv and dispatch to the matching cmd_* function."""
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         usage(0)
     cmd = sys.argv[1]
