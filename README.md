@@ -62,6 +62,34 @@ Add this line to `~/.claude/settings.local.json` under `permissions.allow` so Cl
 "Bash(python3 ~/.claude/skills/ads-cite/ads_cite.py:*)"
 ```
 
+## Teach Claude to actually use it (important)
+
+Installing the skill is not enough. Claude defaults to writing bibtex from
+memory when asked for a citation, and it **will hallucinate** journal names,
+volumes, page numbers, and author lists. Add a rule to your global
+`~/.claude/CLAUDE.md` that redirects all bibtex requests through ads-cite.
+
+Paste this into your `~/.claude/CLAUDE.md` (create the file if it doesn't exist):
+
+```markdown
+## Bibliography rules (STRICT)
+
+- **NEVER hand-write or generate bibtex entries.** Every `.bib` entry must
+  come verbatim from NASA ADS's export endpoint.
+- Always use `.bib` files with `natbib` or `biblatex` — never hardcode
+  citations in `.tex`.
+- **Workflow:** use the `/ads-cite` skill (or `ads-cite` CLI directly) to
+  search ADS, pick the result, then either:
+  - `ads-cite append <BIBFILE> <BIBCODE>` — appends verbatim bibtex to the
+    `.bib` file and skips bibcodes already present
+  - `ads-cite bibtex <BIBCODE>` — prints bibtex for paste-in
+- The cite key IS the ADS bibcode (e.g., `\citep{2016ApJS..224....3N}`).
+  No URL comment needed — the ADS URL is in the bibtex `adsurl` field.
+```
+
+With this in place, when you ask Claude for a citation or to add references
+to a draft, it will run `ads-cite` instead of making up a bibtex entry.
+
 ## Usage — from Claude Code
 
 ```text
