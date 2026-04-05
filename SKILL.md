@@ -60,14 +60,25 @@ Join with implicit AND spaces:
 
 2. **Append to .bib** (preferred when a `.bib` exists in CWD):
    ```bash
-   python3 ~/.claude/skills/ads-cite/ads_cite.py append --rekey <BIBFILE> <BIBCODE>...
+   python3 ~/.claude/skills/ads-cite/ads_cite.py append --rekey --subject <WORD> <BIBFILE> <BIBCODE>
    ```
-   `--rekey` rewrites the citekey from the raw bibcode to `LastName_Subject_Year`
+   **Use `--rekey` by default.** It rewrites the citekey as `LastName_Subject_Year`
    (e.g., `Narayan_ESSENCE_2016`) and prepends `% ADS bibcode: <X>` as a comment
-   so the original identifier is preserved and dedup still works. Pick a good
-   `--subject` word from the paper title; if omitted, ads-cite auto-derives one
-   (prefers uppercase acronyms in the title). Check the existing `.bib` — if it
-   uses raw-bibcode citekeys, drop `--rekey` to match the file's convention.
+   so the original identifier is preserved and dedup still works.
+
+   **Picking the subject:**
+   - If the user's query contained a distinctive capitalized term (project name,
+     survey, object ID) that appears in the chosen paper's title, use it as
+     `--subject`. Examples: user queries `/ads-cite Narayan 2024 ESSENCE` and
+     the result's title contains ESSENCE → `--subject ESSENCE`.
+   - Otherwise, omit `--subject` and let the CLI auto-derive from the title
+     (prefers UPPERCASE acronyms).
+   - If the auto-derived subject would be generic (e.g., "Paper", "Analysis"),
+     propose one to the user before committing.
+
+   **When to skip `--rekey`:** if the target `.bib` already has entries keyed
+   by raw bibcode (`@ARTICLE{2016ApJS..224....3N,...`), match that convention
+   and drop `--rekey` so the file stays consistent. Grep the file first.
 
 3. **Or print bibtex** for paste-in (same `--rekey` / `--subject` flags apply):
    ```bash
@@ -75,6 +86,21 @@ Join with implicit AND spaces:
    ```
 
 When both a preprint and a refereed version appear, prefer the refereed one but mention the preprint alternative.
+
+## Example end-to-end (skill invocation → CLI calls)
+
+User: `/ads-cite Narayan 2024 ESSENCE`
+
+Claude:
+1. Parses: author=Narayan, year range including 2024, text=ESSENCE
+2. Runs: `ads_cite.py search 'author:"Narayan" year:2024 ESSENCE'`
+3. Shows numbered list; user picks #1 → bibcode `2016ApJS..224....3N`
+4. Greps `refs.bib` in CWD: no existing entries, or rekeyed entries present
+5. Runs: `ads_cite.py append --rekey --subject ESSENCE refs.bib 2016ApJS..224....3N`
+6. Reports: "Appended as `Narayan_ESSENCE_2016` to refs.bib"
+
+The `--rekey` and `--subject` flags are chosen by Claude from SKILL.md
+guidance; the user never types them as slash-command args.
 
 ## Other verbs
 
